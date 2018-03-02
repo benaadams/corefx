@@ -367,5 +367,24 @@ namespace System.Memory.Tests
             Assert.Equal("Hello", Encoding.ASCII.GetString(helloBytes));
             Assert.Equal(" World", Encoding.ASCII.GetString(worldBytes));
         }
+
+        [Fact]
+        public void ReadableBufferSequenceWorks()
+        {
+            BufferSegment<byte> firstSegement = new BufferSegment<byte>(new byte[] { 1 });
+            BufferSegment<byte> secondSegement = firstSegement.Append(new byte[] { 2, 2 });
+            BufferSegment<byte> thirdSegement = secondSegement.Append(new byte[] { 3, 3, 3 });
+
+            ReadOnlySequence<byte> buffer = new ReadOnlySequence<byte>(firstSegement, 0, thirdSegement, thirdSegement.Memory.Length);
+
+            SequencePosition position = buffer.Start;
+            int spanCount = 0;
+            while (buffer.TryGet(ref position, out ReadOnlyMemory<byte> memory))
+            {
+                spanCount++;
+                Assert.Equal(spanCount, memory.Length);
+            }
+            Assert.Equal(3, spanCount);
+        }
     }
 }
