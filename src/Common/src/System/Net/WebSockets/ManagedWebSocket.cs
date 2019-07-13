@@ -12,6 +12,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Threading.Tasks.Sources;
 
 namespace System.Net.WebSockets
 {
@@ -151,6 +152,8 @@ namespace System.Net.WebSockets
         /// As such, we need thread-safety in the management of <see cref="_lastReceiveAsync"/>. 
         /// </summary>
         private object ReceiveAsyncLock => _utf8TextState; // some object, as we're simply lock'ing on it
+
+        private EnsureBuffer _ensureBuffer;
 
         /// <summary>Initializes the websocket.</summary>
         /// <param name="stream">The connected Stream.</param>
@@ -1189,32 +1192,32 @@ namespace System.Net.WebSockets
             _receiveBufferOffset += count;
         }
 
-        private async Task EnsureBufferContainsAsync(int minimumRequiredBytes, CancellationToken cancellationToken, bool throwOnPrematureClosure = true)
+        private ValueTask EnsureBufferContainsAsync(int minimumRequiredBytes, CancellationToken cancellationToken, bool throwOnPrematureClosure = true)
         {
             Debug.Assert(minimumRequiredBytes <= _receiveBuffer.Length, $"Requested number of bytes {minimumRequiredBytes} must not exceed {_receiveBuffer.Length}");
-
-            // If we don't have enough data in the buffer to satisfy the minimum required, read some more.
-            if (_receiveBufferCount < minimumRequiredBytes)
+            try
             {
-                // If there's any data in the buffer, shift it down.  
-                if (_receiveBufferCount > 0)
+                // If we don't have enough data in the buffer to satisfy the minimum required, read some more.
+                if (_receiveBufferCount < minimumRequiredBytes)
                 {
-                    _receiveBuffer.Span.Slice(_receiveBufferOffset, _receiveBufferCount).CopyTo(_receiveBuffer.Span);
-                }
-                _receiveBufferOffset = 0;
-
-                // While we don't have enough data, read more.
-                while (_receiveBufferCount < minimumRequiredBytes)
-                {
-                    int numRead = await _stream.ReadAsync(_receiveBuffer.Slice(_receiveBufferCount, _receiveBuffer.Length - _receiveBufferCount), cancellationToken).ConfigureAwait(false);
-                    Debug.Assert(numRead >= 0, $"Expected non-negative bytes read, got {numRead}");
-                    if (numRead <= 0)
+                    // If there's any data in the buffer, shift it down.  
+                    if (_receiveBufferCount > 0)
                     {
-                        ThrowIfEOFUnexpected(throwOnPrematureClosure);
-                        break;
+                        _receiveBuffer.Span.Slice(_receiveBufferOffset, _receiveBufferCount).CopyTo(_receiveBuffer.Span);
                     }
-                    _receiveBufferCount += numRead;
+                    _receiveBufferOffset = 0;
+
+                    EnsureBuffer ensureBuffer = (_ensureBuffer ??= new EnsureBuffer(this));
+                    return ensureBuffer.EnsureBufferContainsAsync(minimumRequiredBytes, cancellationToken, throwOnPrematureClosure);
                 }
+                else
+                {
+                    return default;
+                }
+            }
+            catch (Exception ex)
+            {
+                return new ValueTask(Task.FromException(ex));
             }
         }
 
@@ -1500,6 +1503,116 @@ namespace System.Net.WebSockets
         {
             public WebSocketReceiveResult GetResult(int count, WebSocketMessageType messageType, bool endOfMessage, WebSocketCloseStatus? closeStatus, string closeDescription) =>
                 new WebSocketReceiveResult(count, messageType, endOfMessage, closeStatus, closeDescription);
+        }
+
+        private class EnsureBuffer : IValueTaskSource
+        {
+            private readonly ManagedWebSocket _webSocket;
+            private readonly Action _onComplete;
+            private ManualResetValueTaskSourceCore<VoidResult> _mrvts;
+
+            private int _minimumRequiredBytes;
+            private CancellationToken _cancellationToken;
+            private bool _throwOnPrematureClosure;
+
+            private ValueTaskAwaiter<int> _awaiter;
+
+            public EnsureBuffer(ManagedWebSocket webSocket)
+            {
+                _webSocket = webSocket;
+                _onComplete = new Action(OnComplete);
+            }
+
+            public ValueTask EnsureBufferContainsAsync(int minimumRequiredBytes, CancellationToken cancellationToken, bool throwOnPrematureClosure)
+            {
+                _minimumRequiredBytes = minimumRequiredBytes;
+                _cancellationToken = cancellationToken;
+                _throwOnPrematureClosure = throwOnPrematureClosure;
+
+                EnsureBufferContains();
+
+                return new ValueTask(this, _mrvts.Version);
+            }
+
+            private void EnsureBufferContains()
+            {
+                // While we don't have enough data, read more.
+                while (_webSocket._receiveBufferCount < _minimumRequiredBytes)
+                {
+                    ValueTask<int> vt = ReadAsync();
+                    int numRead;
+                    if (vt.IsCompletedSuccessfully)
+                    {
+                        numRead = vt.Result;
+                    }
+                    else
+                    {
+                        _awaiter = vt.GetAwaiter();
+                        _awaiter.UnsafeOnCompleted(_onComplete);
+                        return;
+                    }
+
+                    Debug.Assert(numRead >= 0, $"Expected non-negative bytes read, got {numRead}");
+                    if (numRead <= 0)
+                    {
+                        _webSocket.ThrowIfEOFUnexpected(_throwOnPrematureClosure);
+                        break;
+                    }
+                    _webSocket._receiveBufferCount += numRead;
+                }
+
+                _mrvts.SetResult(default);
+            }
+
+            private void OnComplete()
+            {
+                try
+                {
+                    int numRead = _awaiter.GetResult();
+                    Debug.Assert(numRead >= 0, $"Expected non-negative bytes read, got {numRead}");
+                    if (numRead <= 0)
+                    {
+                        _webSocket.ThrowIfEOFUnexpected(_throwOnPrematureClosure);
+                        _mrvts.SetResult(default);
+                        return;
+                    }
+                    _webSocket._receiveBufferCount += numRead;
+
+                    if (_webSocket._receiveBufferCount < _minimumRequiredBytes)
+                    {
+                        EnsureBufferContains();
+                    }
+                    else
+                    {
+                        _mrvts.SetResult(default);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _mrvts.SetException(ex);
+                }
+            }
+
+            private ValueTask<int> ReadAsync()
+            {
+                return _webSocket._stream.ReadAsync(
+                    _webSocket._receiveBuffer.Slice(_webSocket._receiveBufferCount, _webSocket._receiveBuffer.Length - _webSocket._receiveBufferCount),
+                    _cancellationToken);
+            }
+
+            void IValueTaskSource.GetResult(short token)
+            {
+                _mrvts.GetResult(token);
+                _mrvts.Reset();
+            }
+
+            ValueTaskSourceStatus IValueTaskSource.GetStatus(short token)
+                => _mrvts.GetStatus(token);
+
+            void IValueTaskSource.OnCompleted(Action<object> continuation, object state, short token, ValueTaskSourceOnCompletedFlags flags)
+                => _mrvts.OnCompleted(continuation, state, token, flags);
+
+            private struct VoidResult { }
         }
     }
 }
