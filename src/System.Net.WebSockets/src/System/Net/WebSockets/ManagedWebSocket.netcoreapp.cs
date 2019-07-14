@@ -10,6 +10,8 @@ namespace System.Net.WebSockets
 {
     internal sealed partial class ManagedWebSocket : WebSocket
     {
+        private AsyncReader<ValueWebSocketReceiveResultGetter, ValueWebSocketReceiveResult> _valueResultAsyncReader;
+
         public override ValueTask SendAsync(ReadOnlyMemory<byte> buffer, WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken)
         {
             return SendPrivateAsync(buffer, messageType, endOfMessage, cancellationToken);
@@ -25,7 +27,8 @@ namespace System.Net.WebSockets
                 lock (ReceiveAsyncLock) // synchronize with receives in CloseAsync
                 {
                     ThrowIfOperationInProgress(_lastReceiveAsync.IsCompleted);
-                    ValueTask<ValueWebSocketReceiveResult> t = ReceiveAsyncPrivate<ValueWebSocketReceiveResultGetter, ValueWebSocketReceiveResult>(buffer, cancellationToken);
+                    var valueResultAsyncReader = (_valueResultAsyncReader ??= new AsyncReader<ValueWebSocketReceiveResultGetter, ValueWebSocketReceiveResult>(this));
+                    ValueTask<ValueWebSocketReceiveResult> t = valueResultAsyncReader.ReceiveAsync(buffer, cancellationToken);
 
                     // WARNING: This code is only valid because ReceiveAsyncPrivate returns a ValueTask that wraps a T or a Task.
                     // If that ever changes where ReceiveAsyncPrivate could wrap an IValueTaskSource, this must also change.
@@ -48,7 +51,8 @@ namespace System.Net.WebSockets
                          !(receiveTask is Task<WebSocketReceiveResult> wsrr && wsrr.Result.MessageType == WebSocketMessageType.Close) &&
                          !(receiveTask is Task<ValueWebSocketReceiveResult> vwsrr && vwsrr.Result.MessageType == WebSocketMessageType.Close)))
             {
-                ValueTask<ValueWebSocketReceiveResult> vt = ReceiveAsyncPrivate<ValueWebSocketReceiveResultGetter, ValueWebSocketReceiveResult>(buffer, cancellationToken);
+                var valueResultAsyncReader = (_valueResultAsyncReader ??= new AsyncReader<ValueWebSocketReceiveResultGetter, ValueWebSocketReceiveResult>(this));
+                ValueTask<ValueWebSocketReceiveResult> vt = valueResultAsyncReader.ReceiveAsync(buffer, cancellationToken);
                 receiveTask =
                     vt.IsCompletedSuccessfully ? (vt.Result.MessageType == WebSocketMessageType.Close ? s_cachedCloseTask : Task.CompletedTask) :
                     vt.AsTask();
